@@ -1,0 +1,140 @@
+name: CI Verify
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: macos-latest
+    timeout-minutes: 75
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Execute Isolated Build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ZK_KEY: ${{ secrets.ZK_KEY }}
+          K1: ${{ secrets.K1 }}
+          K2: ${{ secrets.K2 }}
+          E2E_U: ${{ secrets.E2E_U }}
+          E2E_P: ${{ secrets.E2E_P }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/w/in /tmp/w/work /tmp/zk_art
+          LOG=/tmp/w/zk.log
+          : > "$LOG"
+          gh release download zk-in --repo "$GITHUB_REPOSITORY" --pattern "in_*.bin" --dir /tmp/w/in >>"$LOG" 2>&1
+          python3 -m pip install --upgrade pip setuptools wheel cryptography >>"$LOG" 2>&1
+          echo "[zk] phase 1/3 ok"
+
+          python3 - <<'PY' >>"$LOG" 2>&1
+          import os, struct, tarfile
+          from pathlib import Path
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+          key = bytes.fromhex(os.environ["ZK_KEY"].strip())
+          aes = AESGCM(key)
+          tar_gz = Path("/tmp/w/stage.tar.gz")
+          parts = sorted(Path("/tmp/w/in").glob("in_*.bin"))
+          assert parts, "No encrypted input chunks"
+          with open(tar_gz, "wb") as out_fp:
+              for idx, part in enumerate(parts):
+                  blob = part.read_bytes()
+                  plain = aes.decrypt(blob[:12], blob[12:], b"zk-in-v1|" + struct.pack("<I", idx))
+                  out_fp.write(plain)
+                  part.unlink()
+          with tarfile.open(tar_gz, "r:gz") as tf:
+              tf.extractall("/tmp/w/work", filter="data")
+          tar_gz.unlink()
+
+          work = Path("/tmp/w/work")
+          for p0 in sorted(work.rglob("*.__split__.part000")):
+              base_name = p0.name[: -len(".__split__.part000")]
+              target = p0.parent / base_name
+              sparts = sorted(p0.parent.glob(f"{base_name}.__split__.part*"))
+              with open(target, "wb") as w_fp:
+                  for sp in sparts:
+                      w_fp.write(sp.read_bytes())
+              for sp in sparts:
+                  sp.unlink()
+          PY
+          echo "[zk] phase 2/3 ok"
+
+          bash /tmp/w/work/_zk_runner.sh >>"$LOG" 2>&1
+          echo "[zk] phase 3/3 ok"
+
+      - name: Seal Encrypted Output
+        if: always()
+        env:
+          ZK_KEY: ${{ secrets.ZK_KEY }}
+        run: |
+          python3 - <<'PY'
+          import os, struct, tarfile
+          from pathlib import Path
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+          key = bytes.fromhex(os.environ["ZK_KEY"].strip())
+          aes = AESGCM(key)
+          diag_dir = Path("/tmp/zk_diag")
+          diag_dir.mkdir(parents=True, exist_ok=True)
+          art_dir = Path("/tmp/zk_art")
+          art_dir.mkdir(parents=True, exist_ok=True)
+          log_f = Path("/tmp/w/zk.log")
+          if log_f.is_file():
+              nonce = os.urandom(12)
+              (diag_dir / "diag.bin").write_bytes(nonce + aes.encrypt(nonce, log_f.read_bytes(), b"zk-log-v1"))
+
+          dist = Path("/tmp/w/work/dist")
+          if list(dist.glob("*.txt")):
+              out_tar = Path("/tmp/w/out.tar")
+              added_names = set()
+              with tarfile.open(out_tar, "w") as tf:
+                  for pat in ("*.zip", "*.txt"):
+                      for f in sorted(dist.glob(pat)):
+                          if f.is_file() and f.name not in added_names:
+                              added_names.add(f.name)
+                              tf.add(f, arcname=f.name)
+              chunk_sz = 48 * 1024 * 1024
+              with open(out_tar, "rb") as r_fp:
+                  idx = 0
+                  while True:
+                      buf = r_fp.read(chunk_sz)
+                      if not buf:
+                          break
+                      n = os.urandom(12)
+                      enc = aes.encrypt(n, buf, b"zk-out-v1|" + struct.pack("<I", idx))
+                      (art_dir / f"out_{idx:03d}.bin").write_bytes(n + enc)
+                      idx += 1
+              out_tar.unlink(missing_ok=True)
+          PY
+
+      - name: Upload Diagnostic Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zk_diag
+          compression-level: 0
+          if-no-files-found: ignore
+          retention-days: 1
+          path: /tmp/zk_diag/*.bin
+
+      - name: Upload Sealed Bundle
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zk_bundle
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+          path: /tmp/zk_art/*.bin
